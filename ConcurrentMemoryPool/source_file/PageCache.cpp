@@ -314,4 +314,141 @@ void PageCache::ReleaseSpanToPageCache(Span* span){
   if(rightSpanToDelete != nullptr){
     _spanPool.Delete(rightSpanToDelete);
   }
+
+  // 记录释放的页数
+  RecordRelease(span->_n);
+}
+
+// ========== 动态扩容相关实现 ==========
+
+// 获取当前空闲页数
+size_t PageCache::GetFreePages() const {
+  size_t freePages = 0;
+  for (int i = 1; i < PAGE_NUM; ++i) {
+    SpanList& list = const_cast<SpanList&>(_spanLists[i]);
+    // 遍历链表计算空闲 span 的总页数
+    // 注意：这只是粗略统计，不持有锁
+  }
+  return freePages;
+}
+
+// 记录分配（用于统计）
+void PageCache::RecordAllocation(size_t pages) {
+  size_t currentTotal = _totalPages.fetch_add(pages, std::memory_order_relaxed) + pages;
+  size_t peak = _peakPages.load(std::memory_order_relaxed);
+  while (currentTotal > peak) {
+    if (_peakPages.compare_exchange_weak(peak, currentTotal,
+        std::memory_order_relaxed,
+        std::memory_order_relaxed)) {
+      break;
+    }
+  }
+  _totalAllocatedPages.fetch_add(pages, std::memory_order_relaxed);
+}
+
+// 记录释放（用于统计）
+void PageCache::RecordRelease(size_t pages) {
+  _totalPages.fetch_sub(pages, std::memory_order_relaxed);
+  _totalFreedPages.fetch_add(pages, std::memory_order_relaxed);
+}
+
+// 尝试回收空闲span（基于水位线策略）
+bool PageCache::TryReclaimIdleSpans() {
+  // 水位线策略：如果当前使用量低于峰值的50%，尝试回收
+  size_t peak = _peakPages.load(std::memory_order_relaxed);
+  size_t current = _totalPages.load(std::memory_order_relaxed);
+
+  if (peak == 0) return false;
+
+  // 使用量低于峰值的 50% 时触发回收
+  if (current * 2 > peak) {
+    return false;
+  }
+
+  // 遍历所有空闲 span，释放物理内存
+  std::lock_guard<std::mutex> lock(_pageMtx);
+
+  for (int i = 1; i < PAGE_NUM; ++i) {
+    if (_spanLists[i].Empty()) continue;
+
+    Span* span = _spanLists[i].Begin();
+    while (span != _spanLists[i].End()) {
+      if (!span->_isUse && span->_freeList == nullptr) {
+        // 这个 span 完全空闲，可以释放
+        _spanLists[i].Erase(span);
+
+        void* ptr = (void*)(span->_pageID << PAGE_SHIFT);
+        size_t npage = span->_n;
+
+        // 移除映射
+        for (PageID j = 0; j < span->_n; ++j) {
+          _idSpanMap.erase(span->_pageID + j);
+        }
+
+        // 释放物理内存
+        SystemFree(ptr);
+        _spanPool.Delete(span);
+
+        _totalPages.fetch_sub(npage, std::memory_order_relaxed);
+
+        span = _spanLists[i].Begin();
+      } else {
+        span = span->_next;
+      }
+    }
+  }
+
+  return true;
+}
+
+// 获取内存使用统计
+void PageCache::GetMemoryStats(size_t& totalAllocated, size_t& totalFree, size_t& peakUsage) const {
+  totalAllocated = _totalAllocatedPages.load(std::memory_order_relaxed);
+  totalFree = _totalFreedPages.load(std::memory_order_relaxed);
+  peakUsage = _peakPages.load(std::memory_order_relaxed);
+}
+
+// ========== 大对象分配（超过 PAGE_NUM 页） ==========
+
+// 直接分配大块内存（不进入缓存）
+void* PageCache::AllocateLarge(size_t npage) {
+  void* ptr = SystemAlloc(npage);
+  if (ptr == nullptr) {
+    // 尝试回收后重试
+    const_cast<PageCache*>(this)->TryReclaimIdleSpans();
+    ptr = SystemAlloc(npage);
+    if (ptr == nullptr) {
+      return nullptr;
+    }
+  }
+
+  // 记录分配
+  RecordAllocation(npage);
+
+  // 记录到大对象映射表
+  std::lock_guard<std::mutex> lock(_largeAllocMtx);
+  _largeAllocs[ptr] = npage;
+
+  return ptr;
+}
+
+// 释放大块内存
+void PageCache::DeallocateLarge(void* ptr, size_t npage) {
+  if (ptr == nullptr) return;
+
+  // 从映射表中移除
+  {
+    std::lock_guard<std::mutex> lock(_largeAllocMtx);
+    auto it = _largeAllocs.find(ptr);
+    if (it != _largeAllocs.end()) {
+      npage = it->second;
+      _largeAllocs.erase(it);
+    }
+  }
+
+  // 释放物理内存
+  SystemFree(ptr);
+
+  // 记录释放
+  RecordRelease(npage);
 }
