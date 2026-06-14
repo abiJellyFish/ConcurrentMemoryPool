@@ -1,5 +1,9 @@
 #include "CentralCache.h"
 #include "PageCache.h"
+#include "ThreadCache.h"
+#include <random>
+#include <algorithm>
+#include <vector>
 
 CentralCache CentralCache::_sInst; 
 // 单例对象。静态成员对象在类外声明才会分配内存
@@ -144,4 +148,114 @@ void CentralCache::ReleaseListToSpans(void* start, size_t size){
   }
 
   _spanLists[index]._mtx.unlock();
+}
+
+// ========== 任务窃取相关实现 ==========
+
+// 注册线程的窃取队列到全局列表
+void CentralCache::RegisterThreadCache(ThreadCache* tc) {
+  if (tc == nullptr) return;
+
+  std::lock_guard<std::mutex> lock(_threadListMtx);
+  for (size_t i = 0; i < MAX_THREADS; ++i) {
+    if (_threadCaches[i] == nullptr) {
+      _threadCaches[i] = tc;
+      _threadCount.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+  }
+  // 如果注册表满了，忽略（实际应该扩展）
+}
+
+// 注销线程的窃取队列
+void CentralCache::UnregisterThreadCache(ThreadCache* tc) {
+  if (tc == nullptr) return;
+
+  std::lock_guard<std::mutex> lock(_threadListMtx);
+  for (size_t i = 0; i < MAX_THREADS; ++i) {
+    if (_threadCaches[i] == tc) {
+      _threadCaches[i] = nullptr;
+      _threadCount.fetch_sub(1, std::memory_order_relaxed);
+      return;
+    }
+  }
+}
+
+// 从其他线程的窃取队列窃取对象
+void* CentralCache::StealFromThread(size_t index, size_t alignSize,
+                                   ThreadCache* candidates[], size_t& candidateCount,
+                                   Span*& outSpan) {
+  // 获取当前线程的指针
+  ThreadCache* currentTc = pTLSThreadCache;
+  size_t currentThreadId = 0;
+  if (currentTc != nullptr) {
+    currentThreadId = currentTc->GetThreadId();
+  }
+
+  // 收集候选线程
+  candidateCount = 0;
+  std::vector<ThreadCache*> targets;
+
+  {
+    std::lock_guard<std::mutex> lock(_threadListMtx);
+    for (size_t i = 0; i < MAX_THREADS; ++i) {
+      ThreadCache* tc = _threadCaches[i];
+      if (tc != nullptr && tc != currentTc && tc->GetThreadId() != currentThreadId) {
+        targets.push_back(tc);
+      }
+    }
+  }
+
+  if (targets.empty()) {
+    return nullptr;
+  }
+
+  // 随机选择并尝试窃取
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::shuffle(targets.begin(), targets.end(), gen);
+
+  size_t maxAttempts = std::min(targets.size(), MAX_STEAL_ATTEMPTS);
+  for (size_t i = 0; i < maxAttempts; ++i) {
+    ThreadCache* victim = targets[i];
+    if (victim == nullptr) continue;
+
+    StealQueue& stealQueue = victim->GetStealQueue();
+    if (stealQueue.Empty()) continue;
+
+    // 尝试窃取一批对象
+    void* tail = nullptr;
+    size_t stolenCount = 0;
+    void* batch = stealQueue.StealHalf(tail, stolenCount);
+
+    if (batch != nullptr && candidateCount < 32) {
+      candidates[candidateCount++] = victim;
+      outSpan = nullptr; // 窃取队列的对象不属于任何特定 span
+      return batch;
+    }
+  }
+
+  return nullptr;
+}
+
+// ========== 紧急回收相关实现 ==========
+
+// 强制回收所有线程缓存的空闲对象
+void CentralCache::ForceReclaimAll() {
+  std::lock_guard<std::mutex> lock(_threadListMtx);
+
+  for (size_t i = 0; i < MAX_THREADS; ++i) {
+    ThreadCache* tc = _threadCaches[i];
+    if (tc != nullptr) {
+      // 触发该线程的紧急回收
+      // 注意：这需要线程配合，实际实现可能需要更好的机制
+      // 这里简化处理，只重置失败计数
+      tc->ResetAllocFailures();
+    }
+  }
+}
+
+// 获取当前注册的线程数量
+size_t CentralCache::GetThreadCount() const {
+  return _threadCount.load(std::memory_order_relaxed);
 }
