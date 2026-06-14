@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstddef> // 标准类型，比如size_t
 #include <mutex>
+#include <atomic>
 #include <stdexcept> // 抛出异常头文件
 #include <unordered_map> 
 #include <vector>
@@ -20,6 +21,32 @@ static const size_t MAX_BYTES = 256 * 1024;
 static const size_t PAGE_NUM = 129;
 // 每页有多少位（8KB）
 static const size_t PAGE_SHIFT = 13;
+
+// ========== 任务窃取配置 ==========
+// 最大窃取尝试次数
+static const size_t MAX_STEAL_ATTEMPTS = 3;
+// 窃取批量大小
+static const size_t STEAL_BATCH_SIZE = 16;
+// 窃取阈值：本地 freelist 低于此值时才触发窃取
+static const size_t STEAL_THRESHOLD = 4;
+// 每个线程缓存可拥有的最大窃取队列长度
+static const size_t MAX_STEAL_QUEUE_SIZE = 128;
+
+// ========== 动态扩容配置 ==========
+// 初始预申请的页数（0表示不预申请，按需增长）
+static const size_t INITIAL_PAGE_NUM = 0;
+// 内存回收阈值：空闲对象数量超过此值时尝试回收
+static const size_t RECLAIM_THRESHOLD = 64;
+// Span回收延迟（秒），闲置超过此时间才回收
+static const size_t SPAN_RECLAIM_DELAY_SEC = 60;
+// 内存压力阈值：分配失败次数超过此值时触发紧急回收
+static const size_t MEM_PRESSURE_THRESHOLD = 3;
+
+// ========== 异常处理配置 ==========
+// 是否启用紧急内存预留
+static const bool ENABLE_EMERGENCY_POOL = true;
+// 紧急内存池大小（页）
+static const size_t EMERGENCY_POOL_PAGES = 2;
 
 typedef size_t PageID;
 
@@ -100,7 +127,7 @@ static void*& ObjNext(void* obj){
 // 空闲链表类，用来管理从线程回收的空间
 class FreeList{
 public:
-	size_t Size(){ return _size;}
+	size_t Size() const { return _size;}
 
 	// 范围删除size个内存块，返回删除的空间
 	void PopRange(void*& start, void*& end, size_t size){
@@ -162,6 +189,278 @@ private:
 
 	size_t _size = 0; // 统计当前空闲链表的内存块数量
 };
+
+// ========== 无锁窃取队列（Lock-Free Steal Queue） ==========
+// 基于 Treiber 栈的无锁队列，使用原子 CAS 操作
+class StealQueue {
+public:
+	StealQueue() : _head(nullptr), _size(0) {}
+
+	// 线程安全地向队列头部压入单个对象
+	void Push(void* obj) {
+		assert(obj);
+		Node* new_node = new Node(obj);
+		Node* old_head = _head.load(std::memory_order_relaxed);
+		while (true) {
+			new_node->next = old_head;
+			if (_head.compare_exchange_weak(old_head, new_node,
+				std::memory_order_release,
+				std::memory_order_relaxed)) {
+				_size.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
+			// CAS 失败，old_head 已被更新，重试
+		}
+	}
+
+	// 线程安全地从队列头部弹出单个对象
+	void* Pop() {
+		Node* old_head = _head.load(std::memory_order_relaxed);
+		while (old_head != nullptr) {
+			Node* next = old_head->next;
+			if (_head.compare_exchange_weak(old_head, next,
+				std::memory_order_release,
+				std::memory_order_relaxed)) {
+				void* obj = old_head->obj;
+				delete old_head;
+				_size.fetch_sub(1, std::memory_order_relaxed);
+				return obj;
+			}
+			// CAS 失败，重试
+		}
+		return nullptr;
+	}
+
+	// 批量窃取：从队列头部取出一批对象（用于任务窃取）
+	// 返回取出的对象链表头，nullptr 表示队列为空
+	void* PopBatch(size_t batch_size) {
+		void* head = nullptr;
+		void* tail = nullptr;
+		size_t count = 0;
+
+		Node* old_head = _head.load(std::memory_order_relaxed);
+		while (old_head != nullptr && count < batch_size) {
+			Node* next = old_head->next;
+			if (_head.compare_exchange_weak(old_head, next,
+				std::memory_order_release,
+				std::memory_order_relaxed)) {
+				if (head == nullptr) {
+					head = old_head->obj;
+					tail = old_head->obj;
+				} else {
+					ObjNext(tail) = old_head->obj;
+					tail = old_head->obj;
+				}
+				delete old_head;
+				++count;
+			}
+		}
+
+		if (tail != nullptr) {
+			ObjNext(tail) = nullptr;
+		}
+		_size.fetch_sub(count, std::memory_order_relaxed);
+		return head;
+	}
+
+	// 尝试窃取一半的对象（用于负载均衡）
+	void* StealHalf(void*& tail, size_t& stolen_count) {
+		size_t current_size = _size.load(std::memory_order_relaxed);
+		if (current_size < 2) {
+			tail = nullptr;
+			stolen_count = 0;
+			return nullptr;
+		}
+
+		size_t batch_size = (current_size + 1) / 2;
+		tail = PopBatch(batch_size);
+		stolen_count = batch_size;
+
+		// 找到 tail
+		if (tail != nullptr) {
+			void* cur = tail;
+			for (size_t i = 1; i < batch_size; ++i) {
+				cur = ObjNext(cur);
+			}
+			return tail;
+		}
+		return nullptr;
+	}
+
+	bool Empty() const {
+		return _head.load(std::memory_order_relaxed) == nullptr;
+	}
+
+	size_t Size() const {
+		return _size.load(std::memory_order_relaxed);
+	}
+
+	// 获取所有对象并清空队列（用于调试或统计）
+	void* FlushAll() {
+		Node* old_head = _head.load(std::memory_order_acquire);
+		_head.store(nullptr, std::memory_order_relaxed);
+		_size.store(0, std::memory_order_relaxed);
+
+		if (old_head == nullptr) return nullptr;
+
+		// 翻转链表顺序
+		void* head = nullptr;
+		void* tail = nullptr;
+		while (old_head != nullptr) {
+			Node* node_to_delete = old_head;
+			Node* next = old_head->next;
+			if (head == nullptr) {
+				head = old_head->obj;
+				tail = old_head->obj;
+			} else {
+				ObjNext(tail) = old_head->obj;
+				tail = old_head->obj;
+			}
+			delete node_to_delete;
+			old_head = next;
+		}
+		if (tail != nullptr) {
+			ObjNext(tail) = nullptr;
+		}
+		return head;
+	}
+
+private:
+	struct Node {
+		void* obj;
+		Node* next;
+		Node(void* o) : obj(o), next(nullptr) {}
+	};
+
+	std::atomic<Node*> _head;
+	std::atomic<size_t> _size;
+};
+
+// ========== 紧急内存池 ==========
+// 当系统内存分配失败时，用于满足极小分配需求的预留内存
+class EmergencyPool {
+public:
+	static EmergencyPool& Instance() {
+		static EmergencyPool instance;
+		return instance;
+	}
+
+	// 初始化紧急内存池
+	bool Init() {
+		if (_inited) return true;
+
+		std::lock_guard<std::mutex> lock(_mtx);
+		if (_inited) return true;
+
+		_memory = SystemAlloc(EMERGENCY_POOL_PAGES);
+		if (_memory == nullptr) {
+			return false;
+		}
+		_inited = true;
+		_usedSize = 0;
+		_totalSize = EMERGENCY_POOL_PAGES << PAGE_SHIFT;
+		return true;
+	}
+
+	// 分配极小内存（仅在紧急情况下使用）
+	void* Alloc(size_t size) {
+		if (!ENABLE_EMERGENCY_POOL) return nullptr;
+
+		std::lock_guard<std::mutex> lock(_mtx);
+		if (!_inited) return nullptr;
+
+		size = (size + 63) & ~63; // 对齐到 64 字节
+		if (_usedSize + size > _totalSize) {
+			return nullptr;
+		}
+
+		void* ptr = (char*)_memory + _usedSize;
+		_usedSize += size;
+		return ptr;
+	}
+
+	// 检查紧急池是否还有空间
+	bool HasSpace(size_t size) const {
+		if (!ENABLE_EMERGENCY_POOL) return false;
+		std::lock_guard<std::mutex> lock(_mtx);
+		return _inited && (_usedSize + size <= _totalSize);
+	}
+
+	// 释放所有紧急内存（归还给系统）
+	void Release() {
+		std::lock_guard<std::mutex> lock(_mtx);
+		if (_memory != nullptr) {
+			SystemFree(_memory);
+			_memory = nullptr;
+			_inited = false;
+			_usedSize = 0;
+		}
+	}
+
+	~EmergencyPool() {
+		Release();
+	}
+
+private:
+	EmergencyPool() : _memory(nullptr), _inited(false), _usedSize(0), _totalSize(0) {}
+
+	void* _memory;
+	size_t _totalSize;
+	size_t _usedSize;
+	mutable bool _inited;
+	mutable std::mutex _mtx;
+};
+
+// ========== 调试模式内存检测 ==========
+#ifdef _DEBUG_MODE
+// 魔数用于检测内存越界
+static const size_t MAGIC_HEADER = 0xDEADBEEF;
+static const size_t MAGIC_TAIL = 0xCAFEBABE;
+
+struct MemoryHeader {
+	size_t magic;
+	size_t size;
+	void* thread_id;
+};
+
+inline size_t GetAlignmentPadding(size_t size) {
+	// 保证 header 对齐到 64 字节
+	return (sizeof(MemoryHeader) + 63) & ~63;
+}
+
+inline MemoryHeader* GetHeader(void* obj) {
+	return (MemoryHeader*)((char*)obj - GetAlignmentPadding(sizeof(MemoryHeader)));
+}
+
+inline size_t* GetTailMagic(void* obj, size_t size) {
+	return (size_t*)((char*)obj + size - sizeof(size_t));
+}
+
+inline void SetDebugMagic(void* obj, size_t size) {
+	MemoryHeader* header = GetHeader(obj);
+	header->magic = MAGIC_HEADER;
+	header->size = size;
+	header->thread_id = (void*)std::this_thread::get_id();
+
+	size_t* tail = GetTailMagic(obj, size);
+	*tail = MAGIC_TAIL;
+}
+
+inline bool CheckDebugMagic(void* obj, size_t size) {
+	MemoryHeader* header = GetHeader(obj);
+	if (header->magic != MAGIC_HEADER) {
+		std::cerr << "[DEBUG] Memory header magic corrupted at " << obj << std::endl;
+		return false;
+	}
+
+	size_t* tail = GetTailMagic(obj, size);
+	if (*tail != MAGIC_TAIL) {
+		std::cerr << "[DEBUG] Memory tail magic corrupted at " << obj << std::endl;
+		return false;
+	}
+	return true;
+}
+#endif
 
 // 计算空闲链表中，每个分区对齐后使用的字节数。
 class SizeClass{
